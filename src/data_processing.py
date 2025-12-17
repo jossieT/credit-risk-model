@@ -1,141 +1,285 @@
 import pandas as pd
+import numpy as np
 import os
+import joblib
 import logging
+from typing import List, Tuple, Optional
+from sklearn.base import BaseEstimator, TransformerMixin
+from sklearn.pipeline import Pipeline
+from sklearn.compose import ColumnTransformer
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.impute import SimpleImputer
+from sklearn.cluster import KMeans
+from xverse.transformer import WOE
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-def load_data(path: str) -> pd.DataFrame:
+class DateTimeFeatures(BaseEstimator, TransformerMixin):
     """
-    Loads data from a CSV file.
-
-    Args:
-        path (str): Path to the CSV file.
-
-    Returns:
-        pd.DataFrame: Loaded dataframe.
-
-    Raises:
-        FileNotFoundError: If the file does not exist.
-        ValueError: If the file is empty or missing critical columns.
+    Extracts temporal features from TransactionStartTime.
     """
-    try:
-        if not os.path.exists(path):
-            raise FileNotFoundError(f"File not found at {path}")
+    def __init__(self, date_col: str = 'TransactionStartTime'):
+        self.date_col = date_col
 
-        df = pd.read_csv(path)
+    def fit(self, X, y=None):
+        return self
 
-        if df.empty:
-            raise ValueError("The loaded dataframe is empty.")
+    def transform(self, X):
+        X = X.copy()
+        X[self.date_col] = pd.to_datetime(X[self.date_col])
+        X['transaction_hour'] = X[self.date_col].dt.hour
+        X['transaction_day'] = X[self.date_col].dt.day
+        X['transaction_month'] = X[self.date_col].dt.month
+        X['transaction_year'] = X[self.date_col].dt.year
+        return X
 
-        # Basic validation (checking for some expected columns based on EDA)
-        expected_cols = ['CustomerId', 'TransactionStartTime', 'Amount', 'TransactionId', 'FraudResult']
-        missing_cols = [col for col in expected_cols if col not in df.columns]
-        if missing_cols:
-             logging.warning(f"Missing expected columns: {missing_cols}. Proceeding, but risk mapping might fail if these are required.")
-
-        logging.info(f"Data loaded successfully from {path}. Shape: {df.shape}")
-        return df
-
-    except FileNotFoundError as e:
-        logging.error(e)
-        raise
-    except pd.errors.EmptyDataError:
-        logging.error("File is empty.")
-        raise ValueError("File is empty.")
-    except Exception as e:
-        logging.error(f"An unexpected error occurred while loading data: {e}")
-        raise
-
-def map_risk_target(df: pd.DataFrame) -> pd.DataFrame:
+class CustomerAggregator(BaseEstimator, TransformerMixin):
     """
-    Maps a proxy risk target (default/non-default) based on RFM analysis.
+    Aggregates transactions per CustomerId.
+    """
+    def __init__(self, group_col: str = 'CustomerId'):
+        self.group_col = group_col
+        self.agg_features = {
+            'Amount': ['sum', 'mean', 'count', 'std'],
+            'transaction_hour': ['mean', 'std'],
+            'transaction_day': ['mean'],
+            'transaction_month': ['mean']
+        }
+
+    def fit(self, X, y=None):
+        return self
+
+    def transform(self, X):
+        # Aggregate numeric features
+        agg_df = X.groupby(self.group_col).agg(self.agg_features)
+        
+        # Flatten columns
+        agg_df.columns = [
+            'total_transaction_amount', 'avg_transaction_amount', 
+            'transaction_count', 'std_transaction_amount',
+            'avg_transaction_hour', 'std_transaction_hour',
+            'avg_transaction_day', 'avg_transaction_month'
+        ]
+        
+        # Fill NaN for std if count is 1
+        agg_df = agg_df.fillna(0)
+        
+        # Aggregate categorical features (Mode)
+        cat_cols = ['ProductCategory', 'ChannelId', 'ProviderId']
+        for col in cat_cols:
+            if col in X.columns:
+                mode_df = X.groupby(self.group_col)[col].agg(lambda x: x.mode().iloc[0] if not x.mode().empty else np.nan)
+                agg_df[col] = mode_df
+        
+        return agg_df.reset_index()
+
+def compute_rfm(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Compute RFM metrics for each customer.
+    """
+    df['TransactionStartTime'] = pd.to_datetime(df['TransactionStartTime'])
+    snapshot_date = df['TransactionStartTime'].max() + pd.Timedelta(days=1)
     
-    Proxy Definition:
-    - High Risk (1): Bottom quartile of Frequency (Activity) AND Monetary (Value), 
-                     OR Top quartile of Recency (Inactivity),
-                     OR FraudResult == 1.
-    - Low Risk (0): Otherwise.
+    rfm = df.groupby('CustomerId').agg({
+        'TransactionStartTime': lambda x: (snapshot_date - x.max()).days,
+        'TransactionId': 'count',
+        'Amount': 'sum'
+    }).rename(columns={
+        'TransactionStartTime': 'Recency',
+        'TransactionId': 'Frequency',
+        'Amount': 'Monetary'
+    })
+    return rfm
 
-    Args:
-        df (pd.DataFrame): Input dataframe with transaction data.
-
-    Returns:
-        pd.DataFrame: Dataframe with an additional 'RiskTarget' column (1 = High Risk, 0 = Low Risk).
+def create_is_high_risk(df: pd.DataFrame) -> pd.DataFrame:
     """
-    if df.empty:
-        logging.warning("Input dataframe is empty. Returning empty dataframe with RiskTarget column.")
-        df['RiskTarget'] = []
-        return df
+    Define high risk using KMeans clustering on RFM.
+    """
+    rfm = compute_rfm(df)
+    
+    # Scale RFM before clustering
+    scaler = StandardScaler()
+    rfm_scaled = scaler.fit_transform(rfm)
+    
+    kmeans = KMeans(n_clusters=3, random_state=42, n_init=10)
+    rfm['Cluster'] = kmeans.fit_predict(rfm_scaled)
+    
+    # Identify the high risk cluster (Lowest Frequency, Lowest Monetary, Highest Recency)
+    # We find the cluster with the minimum (Frequency + Monetary - Recency) or similar logic.
+    # Centroids analysis:
+    centroids = rfm.groupby('Cluster')[['Recency', 'Frequency', 'Monetary']].mean()
+    
+    # Define "Least Engaged" cluster: 
+    # High Recency is bad, Low Frequency is bad, Low Monetary is bad.
+    # score = (scaled_recency) - (scaled_frequency) - (scaled_monetary)
+    # The cluster with the HIGHEST score is the most risky.
+    
+    # Let's just use the centroids directly to find the one that fits "least engaged"
+    # least engaged: max recency, min frequency, min monetary
+    
+    # Normalizing centroids to compare them
+    norm_centroids = (centroids - centroids.mean()) / centroids.std()
+    risk_score = norm_centroids['Recency'] - norm_centroids['Frequency'] - norm_centroids['Monetary']
+    high_risk_cluster = risk_score.idxmax()
+    
+    rfm['is_high_risk'] = (rfm['Cluster'] == high_risk_cluster).astype(int)
+    
+    logging.info(f"High risk cluster identified as Cluster {high_risk_cluster}")
+    logging.info(f"Risk distribution:\n{rfm['is_high_risk'].value_counts()}")
+    
+    return rfm[['is_high_risk']]
 
-    required_cols = ['CustomerId', 'TransactionStartTime', 'Amount', 'TransactionId', 'FraudResult']
-    if not all(col in df.columns for col in required_cols):
-        raise ValueError(f"Input dataframe missing required columns for RFM: {required_cols}")
+def get_pipeline(numerical_cols: List[str], categorical_cols: List[str]):
+    """
+    Creates the sklearn Pipeline for feature engineering.
+    """
+    num_transformer = Pipeline(steps=[
+        ('imputer', SimpleImputer(strategy='median')),
+        ('scaler', StandardScaler())
+    ])
+    
+    cat_transformer = Pipeline(steps=[
+        ('imputer', SimpleImputer(strategy='most_frequent')),
+        ('onehot', OneHotEncoder(handle_unknown='ignore', sparse_output=False))
+    ])
+    
+    preprocessor = ColumnTransformer(
+        transformers=[
+            ('num', num_transformer, numerical_cols),
+            ('cat', cat_transformer, categorical_cols)
+        ]
+    )
+    
+    pipeline = Pipeline(steps=[
+        ('preprocessor', preprocessor)
+    ])
+    
+    return pipeline
 
-    try:
-        # Preprocessing
-        df['TransactionStartTime'] = pd.to_datetime(df['TransactionStartTime'])
+class SimpleWoETransformer(BaseEstimator, TransformerMixin):
+    """
+    Custom Weight of Evidence (WoE) transformer.
+    """
+    def __init__(self, columns: List[str] = None):
+        self.columns = columns
+        self.woe_maps = {}
+        self.iv_dict = {}
+
+    def fit(self, X, y):
+        X = X.copy()
+        if self.columns is None:
+            self.columns = X.columns
         
-        # RFM Calculation per Customer
-        # Recency: Days since last transaction (relative to the latest date in dataset)
-        # Frequency: Count of transactions
-        # Monetary: Sum of Amount (Total Spend/Volume)
-        
-        latest_date = df['TransactionStartTime'].max()
-        
-        rfm = df.groupby('CustomerId').agg({
-            'TransactionStartTime': lambda x: (latest_date - x.max()).days,
-            'TransactionId': 'count',
-            'Amount': 'sum',
-            'FraudResult': 'max' # If any fraud, flag as potential risk (or filter out depending on business logic, here we treat as risky)
-        }).rename(columns={
-            'TransactionStartTime': 'Recency',
-            'TransactionId': 'Frequency',
-            'Amount': 'Monetary',
-            'FraudResult': 'HasFraud'
-        })
-        
-        # Quantiles for classification
-        # High Recency = Risk (Dormant)
-        # Low Frequency = Risk (Low Engagement)
-        # Low Monetary = Risk (Low Value/Low Capacity)
-        
-        # Using 0.75 for Recency (Top 25% are most dormant)
-        # Using 0.25 for Frequency/Monetary (Bottom 25% are least active)
-        
-        r_thresh = rfm['Recency'].quantile(0.75)
-        f_thresh = rfm['Frequency'].quantile(0.25)
-        m_thresh = rfm['Monetary'].quantile(0.25)
-        
-        def define_risk(row):
-            # Known Fraud is automatic High Risk
-            if row['HasFraud'] == 1:
-                return 1
-            
-            # High Risk conditions
-            is_dormant = row['Recency'] > r_thresh
-            is_low_value = (row['Frequency'] < f_thresh) and (row['Monetary'] < m_thresh)
-            
-            if is_dormant or is_low_value:
-                return 1
+        for col in self.columns:
+            # Simple binning for numerical
+            if X[col].nunique() > 10:
+                X_binned = pd.qcut(X[col], q=10, duplicates='drop').astype(str)
             else:
-                return 0
+                X_binned = X[col].astype(str)
+            
+            df = pd.DataFrame({'feature': X_binned, 'target': y})
+            counts = df.groupby('feature')['target'].agg(['count', 'sum'])
+            counts['none_event'] = counts['count'] - counts['sum']
+            counts['event_rate'] = counts['sum'] / counts['sum'].sum()
+            counts['none_event_rate'] = counts['none_event'] / counts['none_event'].sum()
+            
+            # Avoid division by zero
+            counts['event_rate'] = counts['event_rate'].replace(0, 0.0001)
+            counts['none_event_rate'] = counts['none_event_rate'].replace(0, 0.0001)
+            
+            counts['woe'] = np.log(counts['none_event_rate'] / counts['event_rate'])
+            counts['iv'] = (counts['none_event_rate'] - counts['event_rate']) * counts['woe']
+            
+            self.woe_maps[col] = counts['woe'].to_dict()
+            self.iv_dict[col] = counts['iv'].sum()
+            
+        return self
 
-        rfm['RiskTarget'] = rfm.apply(define_risk, axis=1)
-        
-        # Merge back to original DF (assigning the customer's risk profile to all their transactions)
-        # Or usually, we return the Customer Level DF for modeling. 
-        # The prompt implies "map_risk_target" might act on the main DF. 
-        # Let's drop the RFM metrics from merge to keep it clean, or keep them if useful features.
-        # For now, we'll map the target back to the main DF.
-        
-        df = df.merge(rfm[['RiskTarget']], on='CustomerId', how='left')
-        
-        logging.info("Risk target mapping completed.")
-        logging.info(f"Risk Distribution:\n{df['RiskTarget'].value_counts(normalize=True)}")
-        
-        return df
+    def transform(self, X):
+        X = X.copy()
+        for col, woe_map in self.woe_maps.items():
+            if X[col].nunique() > 10:
+                X_binned = pd.qcut(X[col], q=10, duplicates='drop').astype(str)
+            else:
+                X_binned = X[col].astype(str)
+            X[col] = X_binned.map(woe_map).fillna(0)
+        return X
 
-    except Exception as e:
-        logging.error(f"Error during risk target mapping: {e}")
-        raise
+def process_data(raw_data_path: str, processed_data_path: str):
+    """
+    Main function to process data and save it.
+    """
+    logging.info(f"Reading raw data from {raw_data_path}")
+    df = pd.read_csv(raw_data_path)
+    
+    # Step 1: Extract Temporal Features
+    dt_features = DateTimeFeatures()
+    df = dt_features.transform(df)
+    
+    # Step 2: Create Target (High Risk) from RFM
+    risk_df = create_is_high_risk(df)
+    
+    # Step 3: Aggregate to Customer Level
+    aggregator = CustomerAggregator()
+    df_agg = aggregator.transform(df)
+    
+    # Step 4: Merge Target
+    df_agg = df_agg.merge(risk_df, on='CustomerId', how='left')
+    
+    # Step 5: Define features for Pipeline
+    numerical_features = [
+        'total_transaction_amount', 'avg_transaction_amount', 
+        'transaction_count', 'std_transaction_amount',
+        'avg_transaction_hour', 'std_transaction_hour',
+        'avg_transaction_day', 'avg_transaction_month'
+    ]
+    categorical_features = ['ProductCategory', 'ChannelId', 'ProviderId']
+    
+    # Step 6: Pipeline for Encoding and Scaling
+    pipeline = get_pipeline(numerical_features, categorical_features)
+    
+    X = df_agg[numerical_features + categorical_features]
+    y = df_agg['is_high_risk']
+    
+    X_processed_array = pipeline.fit_transform(X)
+    
+    # Get feature names from OneHotEncoder
+    cat_encoder = pipeline.named_steps['preprocessor'].named_transformers_['cat'].named_steps['onehot']
+    cat_features_encoded = cat_encoder.get_feature_names_out(categorical_features).tolist()
+    all_features = numerical_features + cat_features_encoded
+    
+    X_processed = pd.DataFrame(X_processed_array, columns=all_features)
+    
+    # Save objects for API
+    model_dir = "models"
+    os.makedirs(model_dir, exist_ok=True)
+    joblib.dump(pipeline, os.path.join(model_dir, "pipeline.pkl"))
+    
+    # Step 7: WoE and IV
+    logging.info("Applying WoE transformation")
+    woe = SimpleWoETransformer(columns=numerical_features)
+    woe.fit(X_processed, y)
+    X_woe = woe.transform(X_processed)
+    
+    joblib.dump(woe, os.path.join(model_dir, "woe.pkl"))
+    
+    # Log IV scores
+    iv_dict = woe.iv_dict
+    logging.info(f"Information Value (IV) scores: {iv_dict}")
+    
+    # Drop features with IV below 0.02
+    threshold = 0.02
+    features_to_drop = [feat for feat, iv in iv_dict.items() if iv < threshold]
+    logging.info(f"Dropping features with IV < {threshold}: {features_to_drop}")
+    X_woe = X_woe.drop(columns=features_to_drop)
+    
+    # Final data
+    final_df = pd.concat([X_woe, y.reset_index(drop=True)], axis=1)
+    
+    os.makedirs(os.path.dirname(processed_data_path), exist_ok=True)
+    final_df.to_csv(processed_data_path, index=False)
+    logging.info(f"Processed data saved to {processed_data_path}")
+
+if __name__ == "__main__":
+    process_data('data/raw/data.csv', 'data/processed/credit_model_features.csv')

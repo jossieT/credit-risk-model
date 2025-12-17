@@ -63,21 +63,96 @@ credit-risk-model/
 ├── data/
 │   ├── raw/
 │   └── processed/
+├── models/                     # Saved pkl models and transformers
 ├── notebooks/
 │   └── eda.ipynb
 ├── src/
-│   ├── __init__.py
-│   ├── data_processing.py
-│   ├── train.py
+│   ├── data_processing.py      # Feature engineering and target creation
+│   ├── train.py                # Training and MLflow tracking
 │   ├── predict.py
 │   └── api/
-│       ├── main.py
-│       └── pydantic_models.py
+│       ├── main.py             # FastAPI entry point
+│       └── pydantic_models.py  # Data models for the API
 ├── tests/
-│   └── test_data_processing.py
+│   └── test_data_processing.py # Unit tests
 ├── Dockerfile
 ├── docker-compose.yml
 ├── requirements.txt
 ├── .gitignore
 └── README.md
 ```
+
+## Implementation Details
+
+### 1. Feature Engineering Pipeline (`src/data_processing.py`)
+
+A fully automated pipeline that transforms raw transaction logs into customer-level features:
+
+- **Temporal Features**: Extraction of hour, day, month, and year from timestamps.
+- **Aggregation**: Programmatic generation of `total_amount`, `avg_amount`, `transaction_count`, and `std_amount` per customer.
+- **Preprocessing**: `SimpleImputer` (Median/Mode), `StandardScaler`, and `OneHotEncoder`.
+- **WoE & IV**: Custom Weight of Evidence transformer to maximize interpretability. Features with Information Value (IV) below 0.02 are automatically dropped.
+
+### 2. High-Risk Proxy Definition
+
+In the absence of historical default labels, we engineered a deterministic target variable:
+
+- **RFM Clustering**: KMeans clustering ($k=3$) on Recency, Frequency, and Monetary metrics.
+- **Risk Assignment**: The "Least Engaged" cluster (High Recency, Low Frequency, Low monetary) is programmatically identified and labeled as `is_high_risk = 1`.
+
+### 3. Model Training & Tracking (`src/train.py`)
+
+- **Experiment Tracking**: Integrated with **MLflow** to log parameters, metrics, and artifacts (confusion matrices).
+- **Hyperparameter Tuning**: `GridSearchCV` used for both Logistic Regression and Random Forest.
+- **Best Model Selection**: Automatic selection based on ROC-AUC scores on a stratified test set.
+
+### 4. Deployment API (`src/api/main.py`)
+
+FastAPI service exposing a `/predict` endpoint:
+
+- **Input**: Customer transaction behavioral summaries.
+- **Output**: Classification (`is_high_risk`) and Probability of Default (PD Score).
+- **Validation**: Strict schema validation using Pydantic models.
+
+## How to Run
+
+### Prerequisites
+
+- Python 3.9+
+- Docker (optional, for containerized run)
+
+### Local Setup
+
+1. **Install Dependencies**:
+   ```bash
+   pip install -r requirements.txt
+   ```
+2. **Process Data**:
+   Generate features and Create high-risk proxy labels.
+   ```bash
+   python src/data_processing.py
+   ```
+3. **Train Models**:
+   Run training, log to MLflow, and save the best model.
+   ```bash
+   python src/train.py
+   ```
+4. **Launch API**:
+   ```bash
+   uvicorn src.api.main:app --host 0.0.0.0 --port 8000
+   ```
+
+### Running with Docker
+
+1. **Spin up the container**:
+   ```bash
+   docker-compose up --build
+   ```
+2. **Access the API**:
+   - Prediction: `POST http://localhost:8000/predict`
+   - Interactive Docs: `http://localhost:8000/docs`
+
+## Quality Assurance
+
+- **Linting**: Run `flake8 src tests`
+- **Testing**: Run `python -m pytest tests/`

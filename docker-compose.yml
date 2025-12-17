@@ -1,11 +1,14 @@
-version: '3.8'
+version: "3.8"
 
 services:
-  api:
+  credit-risk-api:
     build: .
     ports:
       - "8000:8000"
     volumes:
-      - ./src:/app/src
+      - ./models:/app/models
+      - ./data:/app/data
     environment:
-      - MODEL_PATH=/app/models/model.pkl
+      - ENVIRONMENT=production
+      - LOG_LEVEL=INFO
+    restart: always

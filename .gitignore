@@ -25,7 +25,7 @@ wheels/
 .ipynb_checkpoints
 
 # Virtual Env
-.venv
+.venv/
 venv/
 .env
 
